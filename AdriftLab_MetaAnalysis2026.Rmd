@@ -1,0 +1,1077 @@
+---
+title: "AdriftLab_MetaAnalysis2026"
+author: "Alix M. de Jersey, Jack Rivers-Auty, Alex L. Bond and Jennifer L. Lavers"
+date: "2025-11-28"
+output: pdf_document
+---
+
+This document reproduces the quantitative meta-analysis of plastic ingestion in Sable Shearwater fledglings.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,       # Show code
+  warning = FALSE,   # Suppress warnings
+  message = FALSE    # Suppress messages
+)
+
+options(scipen =999 )
+```
+
+```{r load-packages, warning=FALSE, message=FALSE, results='hide' }
+# Load packages, install if required
+packages <- c("ggplot2", "viridisLite", "sjPlot", "MASS", "dplyr", "drc", "boot", "metafor", "forcats", "viridis", "ggfortify")
+invisible(lapply(packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}))
+```
+
+```{r package citations}
+# Use the existing package list
+pkg <- packages 
+
+# Create a character vector for clean citations
+citation_list <- character()  
+
+# Loop through each package and clean citation
+for (i in pkg) {
+  # Get the plain text citation
+  raw <- paste(capture.output(print(citation(i), style = "text", bibtex = FALSE)), collapse = "\n")
+  
+  # Clean: remove _, *, " and trailing . or ,.
+  clean <- gsub("_", "", raw, fixed = TRUE)
+  clean <- gsub("\\*", "", clean)
+  clean <- gsub('\\"', "", clean)            # Handles escaped quotes
+  clean <- gsub('"', "", clean)              # Handles regular quotes
+  clean <- gsub("\\\\texttt\\{(.*?)\\}", "\\1", clean)
+  clean <- gsub(", \\.$", "", clean)
+  clean <- gsub("\\s*\\.$", "", clean)
+  clean <- gsub("[\u201C\u201D]", "", clean)
+  clean <- trimws(clean)
+
+  # Append to citation list
+  citation_list <- c(citation_list, clean)
+}
+
+# Display as a table
+sjPlot::tab_df(
+  data.frame(References = citation_list),
+  col.header = "References",
+  sep = " "
+)
+```
+
+
+
+------------------------------------------------------------------------------
+ABOUT THIS DOCUMENT
+
+ This R Markdown file provides the **code shell** used for the meta-analysis
+ of plastic ingestion in Sable Shearwater fledglings.
+
+ IMPORTANT:
+ - This document includes the full analysis workflow (data processing,
+   modelling and plotting), but **no data files** are distributed here.
+ - All data-loading chunks are written as placeholders only (e.g. `read.csv()`
+ calls) and will not run until you supply your own data in the expected
+ formats.
+
+ CONTENTS
+ - Code for:
+     * Applying Box–Cox transformations and Z-scoring
+     * Fitting linear and four-parameter sigmoidal (4PL) dose–response models
+     * Extracting effect estimates and thresholds (e.g. minimum effect dose,
+       EC50/EC90/EC95)
+     * Generating summary tables and figures
+
+ ------------------------------------------------------------------------------
+
+ DATA IMPORT & CLEANING (GENERIC)
+
+ This chunk is intentionally left flexible.
+ Your only requirement for the analysis pipeline is that, by the end
+ of this chunk, you have an object called `response_df` with:
+
+   - response_df$sample_id     : unique sample identifier
+   - response_df$<marker_name> : response variable (e.g. protein, biomarker)
+   - response_df$plastic_mass  : plastic mass (g) for each sample
+
+ How you get from your raw files to `response_df` is dataset-specific
+ and should be filled in by the user.
+
+ Example (pseudo-code, NOT run):
+ raw_data    <- read.csv("path/to/data.csv", check.names = FALSE)
+ metadata    <- read.csv("path/to/metadata.csv", check.names = FALSE)
+ response_df <- ... # your cleaning / matching / filtering steps
+
+ For this template, we simply assume `response_df` is already created.
+ ---------------------------------------------------------------------------
+
+RUN THIS CHUNK PER RESPONSE 
+
+```{r meta analysis}
+response_df$plastic_mass_log <- log10(response_df$plastic_mass + 1)
+
+data_frame <- response_df
+# =========================
+# Step 1 — Linear model (Box–Cox workflow)
+# Goal:
+#   1) Fit an initial linear model on the raw response (for slope direction).
+#   2) Find a Box–Cox transformation for the response.
+#   3) Standardise (Z-score) the transformed values, with a sign flip so that
+#      positive values always correspond to a "harmful" direction.
+#   4) Fit a linear model on the transformed, standardised response.
+# =========================
+
+# 1. Initial linear model on the raw response vs log10(plastic_mass + 1)
+lm0 <- lm(response_variable ~ plastic_mass_log, data = data_frame)
+
+# 2. Check slope direction on the raw scale:
+#    - If slope < 0 → transform_variable = -1
+#    - If slope > 0 → transform_variable = +1
+#    This lets us flip the sign later so that "higher plastic" = "higher response"
+transform_variable <- ifelse(coef(lm0)["plastic_mass_log"] < 0, -1, 1)
+
+# 3. Search for Box–Cox lambda over [-5, 5]; no plot returned
+bc     <- MASS::boxcox(lm0, lambda = seq(-5, 5, length.out = 33), plotit = FALSE)
+lambda <- bc$x[which.max(bc$y)]
+
+# 4. Apply Box–Cox transformation using the chosen lambda:
+#    - If lambda is effectively 0, use log10 transform.
+#    - Otherwise use the usual power transformation x^lambda.
+response_variable_bc_unscaled <- if (abs(lambda) < 1e-8) {
+  log10(data_frame$response_variable)
+} else {
+  data_frame$response_variable ^ lambda
+}
+
+# 5. Z-score the transformed values for comparability between datasets,
+#    then apply the sign flip from transform_variable.
+response_variable_bc <- scale(response_variable_bc_unscaled) * transform_variable
+
+# 6. Save transformed response into the dataframe for modelling/plots
+data_frame$response_variable_bc <- response_variable_bc
+
+# 7. Linear model on the Box–Cox-transformed, standardised response
+lm_bc <- lm(response_variable_bc ~ plastic_mass_log, data = data_frame)
+
+# 8. Quick scatter to visualise the relationship in transformed space
+plot(response_variable_bc ~ plastic_mass_log,
+     data = data_frame, pch = 16, col = "orange")
+
+# 9. Check linear model assumptions (residuals, QQ, etc.)
+autoplot(lm_bc)
+
+
+# =========================
+# Step 2 — 4-parameter logistic (4PL) model
+# Goal:
+#   Fit a 4-parameter logistic model (4PL) to a scaled version of the response
+#   vs plastic_mass + 1, and test whether the sigmoidal fit gives a significant
+#   improvement over a null model.
+# Model:
+#   y = L + (U - L) / (1 + exp((xmid - x) / scal))
+# =========================
+
+# 1. Standardise raw response (Z-score) and apply the same sign flip so that
+#    higher values reflect a "harmful" direction consistently.
+data_frame$response_variable_raw_scaled <-
+  transform_variable * as.numeric(scale(data_frame$response_variable))
+
+# 2. Add +1 to raw plastic mass for the 4PL x-scale (to keep x > 0)
+data_frame$plastic_mass_plus <- data_frame$plastic_mass + 1
+
+# 3. Fit null (intercept-only) model on the scaled response
+m_null <- lm(response_variable_raw_scaled ~ 1, data = data_frame)
+
+# 4. Fit 4-parameter logistic model using drc::drm with LL.4
+four_pl <- drm(
+  response_variable_raw_scaled ~ plastic_mass_plus,
+  data = data_frame,
+  fct = LL.4(names = c("slope", "lower", "upper", "EC50"))
+)
+
+# 5. Summary of 4PL parameters and fit stats
+summary_4pl <- summary(four_pl)
+
+# 6. Residual sum of squares for null vs 4PL
+RSS_null <- sum(residuals(m_null)^2)
+RSS_dr   <- sum(residuals(four_pl)^2)
+
+# 7. Residual degrees of freedom
+df_null <- df.residual(m_null)
+df_dr   <- df.residual(four_pl)
+
+# 8. F-test for nested models (null vs 4PL)
+F_stat <- ((RSS_null - RSS_dr) / (df_null - df_dr)) /
+          (RSS_dr / df_dr)
+
+Pvalue_Sigmoid <- 1 - pf(F_stat, df_null - df_dr, df_dr)
+
+# 9. Quick 4PL curve plot on original plastic_mass_plus scale
+plot(four_pl, xlim = c(0, 100))
+
+# 10. Raw data vs log10 plastic mass for comparison
+plot(response_variable_raw_scaled ~ plastic_mass_log, data = data_frame)
+
+
+# =========================
+# Step 3 — Adjusted R² (both models)
+# Goal:
+#   Compute adjusted R² for:
+#   - the linear model (already available from summary(lm_bc))
+#   - the 4PL model (using a custom function and predictions)
+# =========================
+
+# 1. Adjusted R² from the linear model on Box–Cox scale
+adj_r2_lm <- summary(lm_bc)$adj.r.squared
+adj_r2_lm
+
+# 2. Custom adjusted R² function for arbitrary predictions
+#    y    = observed response
+#    yhat = predicted response
+#    p    = number of mean parameters in the model
+adj_r2 <- function(y, yhat, p) {
+  n   <- length(y)
+  RSS <- sum((y - yhat)^2)
+  TSS <- sum((y - mean(y))^2)
+  1 - (RSS / (n - p)) / (TSS / (n - 1))
+}
+
+# 3. Predicted values from 4PL at the observed x-values
+dat  <- data_frame
+yhat <- predict(four_pl, newdata = dat)
+
+# 4. Adjusted R² for the 4PL (4 mean parameters)
+adj_r2_4pl <- adj_r2(dat$response_variable_raw_scaled, yhat, p = 4)
+adj_r2_4pl
+
+
+# =========================
+# Step 4 — Predictions & Thresholds (4PL + linear)
+# Goal:
+#   Build prediction grids, obtain uncertainty, and identify thresholds where
+#   predictions diverge from a "baseline" (zero-plastic) level.
+# =========================
+
+# --- Part A: Initial prediction grid for plotting (4PL & linear) -----------
+
+# 1. Grid of plastic mass (grams) for 4PL predictions
+pm_grid <- seq(0, max(data_frame$plastic_mass, na.rm = TRUE), length.out = 2000)
+newd    <- data.frame(plastic_mass_plus = pm_grid + 1)
+
+# 2. Grid for linear model on log scale
+pm_grid_linear <- seq(0, max(data_frame$plastic_mass_log, na.rm = TRUE), length.out = 2000)
+newd_linear    <- data.frame(plastic_mass_log = pm_grid + 1)
+
+# 3. Linear predictions with 95% CI on transformed scale
+predict_linear <- data.frame(
+  predict(lm_bc, newdata = newd_linear, interval = "confidence", level = 0.95)
+)
+
+# 4. Assemble prediction dataframe for the linear model
+pred_df_linear <- data.frame(
+  plastic_mass = pm_grid_linear,
+  fit          = predict_linear$fit,
+  lwr          = predict_linear$lwr,
+  upr          = predict_linear$upr
+)
+
+###############################################################################
+# Bootstrapping 4PL:
+# Goal:
+#   Bootstrap the 4PL fit to obtain robust prediction intervals across pm_grid.
+###############################################################################
+
+# 1. Per-resample fit + predict function
+#    Returns bootstrapped predictions across the current pm_grid.
+pred_fun <- function(data, indices) {
+  d <- data[indices, ]
+  fit <- try(
+    drm(response_variable_raw_scaled ~ plastic_mass_plus,
+        data = d, fct = LL.4()),
+    silent = TRUE
+  )
+  if (inherits(fit, "try-error")) return(rep(NA, length(pm_grid)))
+  predict(fit, newdata = data.frame(plastic_mass_plus = pm_grid + 1))
+}
+
+# 2. Number of bootstrap resamples
+boot_number <- 2000
+
+# 3. Run bootstrap
+boot_out <- boot(data_frame, pred_fun, R = boot_number)
+
+# 4. Extract 95% bootstrap interval at each grid point
+ci_low  <- apply(boot_out$t, 2, quantile, 0.025, na.rm = TRUE)
+ci_high <- apply(boot_out$t, 2, quantile, 0.975, na.rm = TRUE)
+
+# 5. Reset pm_grid to the observed plastic mass range (avoid crazy extrapolation)
+pm_grid <- seq(
+  min(data_frame$plastic_mass, na.rm = TRUE),
+  max(data_frame$plastic_mass, na.rm = TRUE),
+  length.out = boot_number
+)
+newd <- data.frame(plastic_mass_plus = pm_grid + 1)
+
+# 6. Point prediction from the fitted 4PL
+pred_fit <- as.numeric(predict(four_pl, newdata = newd))
+
+# 7. Combine 4PL predictions + bootstrap CIs
+pred_df <- data.frame(
+  plastic_mass = pm_grid,
+  fit          = pred_fit,
+  lwr_boot     = ci_low,
+  upr_boot     = ci_high
+)
+
+# 8. (Optional) delta-method CI from drc, for comparison with bootstrap CIs
+dm <- as.data.frame(
+  predict(four_pl, newdata = newd, interval = "confidence", level = 0.95)
+)
+names(dm) <- c("fit_dm", "lwr_dm", "upr_dm")
+pred_df   <- cbind(pred_df, dm)
+
+# 9. Baseline at zero-plastic:
+#    mean of observed scaled responses where plastic_mass == 0.
+baseline <- mean(
+  data_frame$response_variable_raw_scaled[data_frame$plastic_mass == 0],
+  na.rm = TRUE
+)
+
+# 10. Fallback if there are no true zeros: use the lowest observed plastic mass.
+if (any(data_frame$plastic_mass == 0, na.rm = TRUE)) {
+  baseline <- mean(
+    data_frame$response_variable_raw_scaled[data_frame$plastic_mass == 0],
+    na.rm = TRUE
+  )
+} else {
+  min_mass <- min(data_frame$plastic_mass, na.rm = TRUE)
+  baseline <- mean(
+    data_frame$response_variable_raw_scaled[data_frame$plastic_mass == min_mass],
+    na.rm = TRUE
+  )
+}
+
+# 11. Threshold: first plastic mass where the 95% bootstrap CI excludes the baseline
+outside  <- (pred_df$upr_boot < baseline) | (pred_df$lwr_boot > baseline)
+thr_idx  <- which(outside)[1]
+threshold_mass <- if (length(thr_idx)) pred_df$plastic_mass[thr_idx] else NA_real_
+
+# 12. Visualisation: raw points, 4PL fit, bootstrap CI, baseline, threshold
+four_pl_plot <- ggplot() +
+  # raw points
+  geom_point(
+    data = data_frame,
+    aes(x = plastic_mass, y = response_variable_raw_scaled),
+    alpha = 0.7, size = 2
+  ) +
+  # bootstrapped CI ribbon
+  geom_ribbon(
+    data = pred_df,
+    aes(x = plastic_mass, ymin = lwr_boot, ymax = upr_boot),
+    alpha = 0.18
+  ) +
+  # fitted curve
+  geom_line(
+    data = pred_df,
+    aes(x = plastic_mass, y = fit),
+    linewidth = 1.1
+  ) +
+  # baseline + threshold markers
+  geom_hline(yintercept = baseline, linetype = "dashed") +
+  { if (!is.na(threshold_mass))
+      geom_vline(xintercept = threshold_mass, linetype = "dotted") else NULL } +
+  labs(
+    x        = "Plastic mass (g)",
+    y        = paste(response_name, "Z score"),
+    title    = paste(response_name, "4PL fit with bootstrapped 95% CI vs real data"),
+    subtitle = if (!is.na(threshold_mass))
+      paste0("Threshold (CI excludes zero-plastic mean) ≈ ",
+             round(threshold_mass, 3), " g")
+    else
+      "No threshold: CI never excludes the zero-plastic mean within the observed range"
+  ) +
+  scale_x_continuous(trans = "pseudo_log") +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid  = element_blank(),
+    axis.line   = element_line(linewidth = 0.5),
+    plot.title  = element_text(face = "bold", hjust = 0.5)
+  )
+
+
+# =========================
+# Step 4 (continued) — Linear model thresholds
+# Goal:
+#   Use the linear model on Box–Cox scale to identify the first point at which
+#   the 95% CI departs from the baseline mean.
+# =========================
+
+# 1. Prediction grid on the log scale for the linear model
+pm_grid_linear <- seq(0, max(data_frame$plastic_mass_log, na.rm = TRUE), length.out = 2000)
+newd_linear    <- data.frame(plastic_mass_log = pm_grid_linear)
+
+# 2. Predict fit + 95% CI from the linear model (Box–Cox scale)
+pred_linear <- as.data.frame(
+  predict(lm_bc, newdata = newd_linear, interval = "confidence", level = 0.95)
+)
+
+pred_df_linear <- data.frame(
+  plastic_mass_log = pm_grid_linear,
+  fit              = pred_linear$fit,
+  lwr              = pred_linear$lwr,
+  upr              = pred_linear$upr
+)
+
+# 3. Baseline on the Box–Cox scale:
+#    mean of transformed response where plastic_mass == 0.
+baseline_bc <- with(
+  data_frame,
+  mean(response_variable_bc[plastic_mass == 0], na.rm = TRUE)
+)
+
+# 4. Fallback if no exact zeros exist:
+if (!is.finite(baseline_bc)) {
+  baseline_bc <- with(data_frame, {
+    min_mass <- min(plastic_mass, na.rm = TRUE)
+    mean(response_variable_bc[plastic_mass == min_mass], na.rm = TRUE)
+  })
+}
+
+# 5. Threshold logic:
+#    - slope > 0 → look for first x where lower CI > baseline
+#    - slope < 0 → look for first x where upper CI < baseline
+#    - slope ~ 0 → no threshold
+slope_bc <- coef(lm_bc)["plastic_mass_log"]
+
+if (is.finite(slope_bc) && slope_bc > 0) {
+  idx <- which(pred_df_linear$lwr > baseline_bc)[1]
+} else if (is.finite(slope_bc) && slope_bc < 0) {
+  idx <- which(pred_df_linear$upr < baseline_bc)[1]
+} else {
+  idx <- integer(0)
+}
+
+threshold_log    <- if (length(idx) && !is.na(idx)) pred_df_linear$plastic_mass_log[idx] else NA_real_
+threshold_mass_g <- if (is.finite(threshold_log)) (10^threshold_log - 1) else NA_real_
+
+cat("Threshold (log10 scale):", threshold_log, "\n")
+cat("Threshold (grams):", threshold_mass_g, "\n")
+
+# 6. Linear model plot with baseline + threshold markers
+lm_plot <- ggplot() +
+  geom_point(
+    data = data_frame,
+    aes(x = plastic_mass_log, y = response_variable_bc),
+    alpha = 0.7, size = 2
+  ) +
+  geom_ribbon(
+    data = pred_df_linear,
+    aes(x = plastic_mass_log, ymin = lwr, ymax = upr),
+    alpha = 0.18
+  ) +
+  geom_line(
+    data = pred_df_linear,
+    aes(x = plastic_mass_log, y = fit),
+    linewidth = 1.05
+  ) +
+  geom_hline(yintercept = baseline_bc, linetype = "dashed") +
+  { if (is.finite(threshold_log))
+      geom_vline(xintercept = threshold_log, linetype = "dotted") else NULL } +
+  labs(
+    x        = expression(log[10] ~ "(Plastic mass + 1)"),
+    y        = paste(response_name, "response (Box–Cox scale)"),
+    title    = paste(response_name, "linear fit (95% CI) on log plastic mass"),
+    subtitle = if (is.finite(threshold_mass_g))
+      paste0(
+        "First mass where lower 95% CI > zero-plastic mean: ~",
+        round(threshold_mass_g, 3), " g"
+      ) else
+      "No threshold found: lower 95% CI never exceeds zero-plastic mean"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line  = element_line(linewidth = 0.5),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+
+# =========================
+# Step 4 — Max dose threshold (plateau)
+# Goal:
+#   Using 4PL parameters, identify the plastic masses at which the response
+#   reaches 90%, 95% and ~100% of the span from L to U.
+# =========================
+
+# 1. Extract lower (L) and upper (U) asymptotes from fitted 4PL
+pars <- coef(four_pl)
+U    <- unname(pars["upper:(Intercept)"])
+L    <- unname(pars["lower:(Intercept)"])
+
+# 2. Fraction of the response span reached at each x
+frac <- (pred_df$fit - L) / (U - L)
+
+# 3. Targets for "near plateau"
+lower_target <- 0.9   # 90%
+upper_target <- 1     # ~100%
+target       <- 0.95  # 95%
+
+# 4. Mass where 90% of the span is first reached
+ix_lower <- which(frac >= lower_target)[1]
+plateau_mass_g_lower <- if (length(ix_lower)) pred_df$plastic_mass[ix_lower] else NA_real_
+
+# 5. Mass where ~100% of the span is first reached
+ix_upper <- which(frac >= upper_target)[1]
+plateau_mass_g_upper <- if (length(ix_upper)) pred_df$plastic_mass[ix_upper] else NA_real_
+
+# 6. Mass where 95% of the span is first reached
+ix <- which(frac >= target)[1]
+plateau_mass_g <- if (length(ix)) pred_df$plastic_mass[ix] else NA_real_
+
+plateau_mass_g
+plateau_mass_g_lower
+plateau_mass_g_upper
+
+
+# =========================
+# Step 5 — Model choice & extraction
+# Goal:
+#   Decide whether the linear or 4PL model is preferred, based on:
+#   - significance vs null
+#   - adjusted R²
+#   Then extract summary statistics for downstream meta-analysis.
+# =========================
+
+# 1. P-value for the linear term (Box–Cox model) vs null
+Pvalue_Linear <- anova(lm_bc)$"Pr(>F)"[1]
+
+# 2. Null model for the scaled response (for the 4PL comparison)
+m_null <- lm(response_variable_raw_scaled ~ 1, data = data_frame)
+
+# 3. Residual sum of squares for null vs 4PL
+RSS_null <- sum(residuals(m_null)^2)
+RSS_dr   <- sum(residuals(four_pl)^2)
+
+# 4. Residual df
+df_null <- df.residual(m_null)
+df_dr   <- df.residual(four_pl)
+
+# 5. F-test for 4PL vs null
+F_stat <- ((RSS_null - RSS_dr) / (df_null - df_dr)) /
+          (RSS_dr / df_dr)
+
+Pvalue_Sigmoid <- 1 - pf(F_stat, df_null - df_dr, df_dr)
+
+# 6. NA-safe significance flags (not actually used below, but kept for clarity)
+sig_lm  <- !is.na(Pvalue_Linear)  && Pvalue_Linear  < 0.05
+sig_4pl <- !is.na(Pvalue_Sigmoid) && Pvalue_Sigmoid < 0.05
+
+# 7. Model choice logic:
+#    - If only linear is significant  → choose Linear
+#    - If only 4PL is significant    → choose Sigmoid
+#    - If both are significant       → choose the one with higher adj R²
+#    - If neither is significant     → "No significant relationship detected"
+model_choice <- if (Pvalue_Linear < 0.05 & Pvalue_Sigmoid > 0.05) {
+  "Linear"
+} else if (Pvalue_Linear > 0.05 & Pvalue_Sigmoid < 0.05) {
+  "Sigmoid"
+} else if (Pvalue_Linear < 0.05 & Pvalue_Sigmoid < 0.05) {
+  if (adj_r2_lm >= adj_r2_4pl) "Linear" else "Sigmoid"
+} else {
+  "No significant relationship detected"
+}
+
+# 8. Extract slope on Box–Cox scale and its SE (absolute value of slope)
+ct <- summary(lm_bc)$coefficients
+b  <- abs(ct["plastic_mass_log", "Estimate"])
+se <- ct["plastic_mass_log", "Std. Error"]
+
+# 9. Effect size proxy (R) and its approximate SE
+r       <- sqrt(summary(lm_bc)$r.squared)
+r_error <- 1 / sqrt(summary(lm_bc)$df[2] + summary(lm_bc)$df[1])
+
+# 10. EC50 and 95% CI (on plastic mass scale, subtract 1 to remove +1 offset)
+EC50    <- summary_4pl$coefficients["EC50:(Intercept)", "Estimate"] - 1
+EC50_SE <- summary_4pl$coefficients["EC50:(Intercept)", "Std. Error"]
+
+EC50_95CI_Lower <- EC50 - 1.96 * EC50_SE
+EC50_95CI_Upper <- EC50 + 1.96 * EC50_SE
+
+# 11. Apply model_choice to set model label + minimum threshold
+if (model_choice == "Linear") {
+  model             <- "Linear_BoxCox"
+  Minimum_threshold <- threshold_mass_g
+
+} else if (model_choice == "Sigmoid") {
+  model             <- "Four parameter Sigmoidal"
+  Minimum_threshold <- threshold_mass
+
+} else {
+  model             <- "No significant relationship detected"
+  Minimum_threshold <- NA
+}
+
+
+# =========================
+# Step 6 — Tidy results dataframe
+# Goal:
+#   Produce a single-row summary dataframe for this response, ready to be
+#   stacked into a meta-analysis table across multiple markers/years.
+# =========================
+
+result_dataframe <- data.frame(
+  Response_variable = response_name,
+  Year              = year,
+  Model_Chosen      = model,          # or = model_choice if you prefer "Linear"/"Sigmoid"
+  Lambda_BoxCox     = lambda,
+  Rsquared_Linear   = adj_r2_lm,
+  Pvalue_Linear     = Pvalue_Linear,
+  Rsquared_Sigmoid  = adj_r2_4pl,
+  Pvalue_Sigmoid    = Pvalue_Sigmoid,
+  N                 = summary(lm_bc)$df[2] + summary(lm_bc)$df[1],
+  R                 = r,
+  R_error           = r_error,
+  Slope_Z           = b,
+  Slope_SE_Z        = se,
+  Slope_CI95_Lower_Z = b - 1.96 * se,
+  Slope_CI95_Upper_Z = b + 1.96 * se,
+  EC50              = EC50,
+  EC50_SE           = EC50_SE,
+  EC50_95CI_Lower   = EC50_95CI_Lower,
+  EC50_95CI_Upper   = EC50_95CI_Upper,
+  Minimum_threshold = Minimum_threshold,
+  EC95              = plateau_mass_g,
+  EC90              = plateau_mass_g_lower,
+  ECMAX             = plateau_mass_g_upper
+)
+
+print(result_dataframe)
+
+# Store objects in the global environment using the response name
+assign(response_variable, data_frame)
+assign(paste0(response_variable, "_4pl_plot"), four_pl_plot)
+assign(paste0(response_variable, "_lm_plot"),  lm_plot)
+
+# Export the single-row summary to CSV (one file per response)
+write.csv(result_dataframe, paste0(response_name, ".csv"))
+
+# Also store the result dataframe under a standard name
+assign(paste0("results_", response_variable), result_dataframe)
+
+# Finally, print the plots
+print(lm_plot)
+print(four_pl_plot)
+```
+
+
+
+
+# ========================================================
+# GRAPHING RESULTS
+# ========================================================
+
+
+---------------------------------------------------------------------------
+ Combine per-effect CSV outputs into a single meta-analysis table
+
+ This chunk:
+   - Reads all .csv files exported by the previous analysis chunks
+   - Assumes each file contains a one-row summary (result_dataframe)
+   - Row-binds them into a single data frame: `meta_results`
+
+ NOTE:
+   - Set `folder_path` to the directory containing only the exported
+     summary CSV files (or use a filename pattern to restrict further).
+---------------------------------------------------------------------------
+
+
+```{r combine data}
+# Path to folder containing the per-effect CSV files
+folder_path <- "Insert folder path which should be a folder of all the .csv files exported above"
+
+# List all .csv files in that folder
+files <- list.files(
+  path       = folder_path,
+  pattern    = "\\.csv$",
+  full.names = TRUE
+)
+
+# Read each CSV into a list of data frames
+data_list <- lapply(files, read.csv)
+
+# Combine all rows into a single meta-analysis dataframe
+meta_results <- do.call(rbind, data_list)
+```
+
+---------------------------------------------------------------------------
+ 2. Add organ classification and plotting colours
+
+ This chunk:
+   - Maps each response variable to an Organ category using a user-defined look-up vector 
+    `effect_to_organ`.
+   - Defines a fixed colour palette for each organ to ensure consistent
+     visual identity across figures.
+
+ Assumes:
+   - `effect_to_organ` is a named character vector where names correspond to
+     meta_results$Response_variable and values are organ labels, e.g.:
+
+     effect_to_organ <- c(
+       "Albumin_2023" = "Liver",
+       "Glucose_2023" = "Blood"
+       # ...
+     )
+---------------------------------------------------------------------------
+
+```{r add-organ-and-colours}
+# Map each response (row) to its corresponding Organ
+meta_results$Organ <- effect_to_organ[meta_results$Response_variable]
+
+# Define a named colour palette for organs (hex codes fixed for consistency)
+org_cols <- c(
+  "Proventriculus" = "#7ad151",
+  "Liver"          = "#33b67a",
+  "Kidney"         = "#1f958b",
+  "Feather"        = "#2c738e",
+  "Brain"          = "#3c4f8a",
+  "Blood"          = "#482576"
+)
+
+# Add an Organ_colour column to use directly in ggplot
+meta_results <- meta_results %>%
+  dplyr::mutate(Organ_colour = org_cols[Organ])
+
+# `meta_results` now contains:
+#   - one row per response variable
+#   - model/threshold outputs from the analysis pipeline
+#   - Organ (factor-level grouping)
+#   - Organ_colour (hex string for use in plotting)
+# ---------------------------------------------------------------------------
+```
+
+
+---------------------------------------------------------------------------
+ Minimum dose thresholds by effect (Fig 3A)
+
+ This section:
+   1. Filters the meta-analysis results to retain only effects with
+      (i) a chosen model and (ii) an estimated minimum threshold.
+   2. Orders effects within each organ by their minimum threshold.
+   3. Produces a bubble plot of minimum dose thresholds by effect,
+      with point size = sample size (N), colour = organ, and
+      shape = model type (Linear vs 4PL).
+---------------------------------------------------------------------------
+
+
+```{r fig3a}
+# 1. Filter from meta_results & order within Organ
+meta_results2 <- meta_results %>%
+  filter(
+    Model_Chosen != "No significant relationship detected",  # keep only significant relationships
+    !is.na(Minimum_threshold),                               # require an estimated minimum threshold
+    !is.na(Organ)                                            # require organ classification
+  ) %>%
+  mutate(
+    # Order organs to match the reversed order of org_cols
+    Organ = factor(Organ, levels = rev(names(org_cols)))
+  ) %>%
+  arrange(
+    Organ,
+    desc(Minimum_threshold)  # within each organ, sort from highest to lowest threshold
+  ) %>%
+  mutate(
+    # Fix the y-order of effects according to their ordering in the arranged data
+    Response_variable = factor(Response_variable,
+                               levels = unique(Response_variable))
+  )
+
+# 2. Plot minimum dose threshold by effect
+fig3a <- ggplot(meta_results2,
+                aes(x = Minimum_threshold,
+                    y = Response_variable)) +
+  # Reference line at zero plastic dose
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6) +
+
+  # Main points:
+  #   - size   = sample size (N)
+  #   - colour = organ
+  #   - shape  = model used (Linear vs 4PL)
+  geom_point(
+    aes(size = N, colour = Organ, shape = Model_Chosen),
+    alpha = 0.9
+  ) +
+
+  # Encode model type by shape
+  scale_shape_manual(
+    values = c(
+      "Four parameter Sigmoidal" = 15,  # square
+      "Linear_BoxCox"            = 16   # circle
+    ),
+    name = "Model"
+  ) +
+
+  # Use predefined organ colours for consistency across figures
+  scale_colour_manual(values = org_cols, name = "Organ") +
+
+  # Scale point size by sample size, using an area-based scale
+  scale_size_area(
+    max_size = 12,
+    breaks   = pretty(meta_results2$N),
+    guide    = guide_legend(title = "n")
+  ) +
+
+  # Square-root transform on the x-axis to spread out smaller thresholds
+  scale_x_continuous(trans = "sqrt") +
+
+  labs(
+    x     = "Minimum dose threshold (g plastic)",
+    y     = NULL,
+    title = "Minimum dose threshold by effect"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid        = element_blank(),
+    axis.line         = element_line(linewidth = 0.4),
+    plot.title        = element_text(face = "bold", hjust = 0.5),
+    legend.position   = "right",
+    axis.text.x       = element_text(angle = 45, hjust = 1),
+    axis.ticks.length = unit(4, "pt")
+  )
+
+# Print figure
+fig3a
+```
+
+
+
+
+
+
+
+---------------------------------------------------------------------------
+Fig 3B — Effect sizes (R) by response
+
+ This figure:
+   - Shows the effect size (R) for each response variable.
+   - Uses horizontal position = R, vertical position = response variable.
+   - Colours points by organ.
+     the desired y-axis order of Response_variable (matching Fig 3A).
+---------------------------------------------------------------------------
+
+```{r fig3b}
+# 1. Prepare dataframe for Fig 3B
+
+r_df <- meta_results %>%
+  filter(
+    Model_Chosen != "No significant relationship detected",  # keep only effects with a selected model
+    !is.na(R),                                               # require an R value
+    Response_variable %in% rev_order                         # restrict to responses included in the plotted order
+  ) %>%
+  mutate(
+    # If R_error represents the standard error of R, construct an approximate
+    # 95% confidence interval (R ± 1.96 * SE)
+    R_low  = R - 1.96 * R_error,
+    R_high = R + 1.96 * R_error,
+
+    # Enforce the desired y-axis order for response variables
+    Response_variable = factor(Response_variable, levels = rev_order)
+  )
+
+# 2. Plot: effect size R by response variable
+
+fig3b <- ggplot(r_df, aes(x = R, y = Response_variable, colour = Organ)) +
+  # Reference line at R = 0 (no effect)
+  geom_vline(xintercept = 0, linetype = "dashed") +
+
+  # Point for each effect (one per response variable / dataset)
+  geom_point(size = 4) +
+
+  # Continuous organ colour scale (viridis) for accessibility and consistency
+  scale_colour_viridis_d(option = "D", begin = 0.1, end = 0.8) +
+
+  # Classic theme for a simple, clean panel
+  theme_classic() +
+
+  # Enforce y-axis order (reverse if `rev` is a vector of labels defined upstream)
+  scale_y_discrete(limits = rev)
+
+# Print figure
+fig3b
+
+```
+
+
+
+
+
+
+---------------------------------------------------------------------------
+ Fig 3C — EC95 and plateau ranges by effect
+
+ This figure:
+   - Shows EC95 (x-position) for each response variable (y-position).
+   - Draws horizontal segments representing:
+       * EC90 → ECMAX when ECMAX is available (full plateau range).
+       * EC90 → EC95 when ECMAX is missing (partial approach to plateau).
+   - Colours points and segments by organ using the same palette as other panels.
+---------------------------------------------------------------------------
+
+```{r fig3c}
+# 1) Build EC95 / EC90 / ECMAX dataframe from meta_results
+ec95_df <- meta_results %>%
+  filter(
+    Model_Chosen == "Four parameter Sigmoidal",
+    !is.na(EC95),
+    !is.na(Organ)              # use Organ already in meta_results
+  ) %>%
+  mutate(
+    label = Response_variable
+  ) %>%
+  arrange(Organ, EC95) %>%
+  mutate(
+    label = factor(label, levels = label)   # preserves this arranged order on the y-axis
+  )
+
+# Plot EC95 with EC90 - ECMAX ranges
+fig3c <- ggplot(ec95_df, aes(x = EC95, y = label, colour = Organ)) +
+  # Reference line at 0 g plastic
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6) +
+
+  # Horizontal segment from EC90 to ECMAX when ECMAX is available
+  geom_errorbarh(
+    data = subset(ec95_df, !is.na(ECMAX)),
+    aes(xmin = EC90, xmax = ECMAX, y = label),
+    height = 0,
+    linewidth = 1
+  ) +
+
+  # Horizontal segment from EC90 to EC95 when ECMAX is missing
+  geom_errorbarh(
+    data = subset(ec95_df, is.na(ECMAX) & !is.na(EC95)),
+    aes(xmin = EC90, xmax = EC95, y = label),
+    height = 0,
+    linewidth = 1
+  ) +
+
+  # EC95 point for each effect
+  geom_point(size = 5) +
+
+  # Use predefined organ colours for consistency across figures
+  scale_colour_manual(values = org_cols, name = "Organ") +
+
+  # Square-root transformation on the x-axis to spread out lower values
+  scale_x_continuous(trans = "sqrt") +
+
+  # Optional: flip y-axis order if a reversed order is desired, e.g.:
+  # scale_y_discrete(limits = rev) +
+
+  labs(
+    x     = "EC95 (g plastic, sqrt scale)",
+    y     = NULL,
+    title = "EC95 with EC90–ECMAX range"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid  = element_blank(),
+    axis.line   = element_line(linewidth = 0.4),
+    plot.title  = element_text(face = "bold", hjust = 0.5)
+  )
+
+# Print figure
+fig3c
+```
+
+
+
+---------------------------------------------------------------------------
+ Fig 3D — Linear model slopes (forest-style plot)
+
+ This figure:
+   - Shows the slope (effect size on the Z-scaled, Box–Cox-transformed response)
+     for all effects where the linear model was chosen.
+   - Includes 95% confidence intervals for each slope.
+   - Colours points and intervals by organ, using the same palette as other panels.
+
+---------------------------------------------------------------------------
+
+```{r fig3d}
+
+# 1) Filter to linear models and prepare ordering
+linear_df <- meta_results %>%
+  filter(
+    Model_Chosen == "Linear_BoxCox",
+    !is.na(Slope_Z),
+    !is.na(Organ)                # ensure Organ exists
+  ) %>%
+  arrange(Organ, desc(Slope_Z)) %>%
+  mutate(
+    Response_variable = factor(
+      Response_variable,
+      levels = unique(Response_variable)
+    )
+  )
+
+# 2) # 2) Forest-style plot of linear model slopes
+#
+#   - x-axis = Slope_Z (effect size on Z-scaled, Box–Cox-transformed response).
+#   - y-axis = Response_variable.
+#   - Horizontal error bars = 95% CI for slope.
+#   - Vertical dashed line at 0 indicates no change with plastic mass.
+#   - Colours correspond to organs (consistent with other figure panels).
+# ---------------------------------------------------------------------------
+fig3d <- ggplot(linear_df,
+                aes(y = Response_variable,
+                    x = Slope_Z,
+                    colour = Organ)) +
+  
+  # 95% confidence intervals for slope
+  geom_errorbarh(
+    aes(
+      xmin = Slope_CI95_Lower_Z,
+      xmax = Slope_CI95_Upper_Z
+    ),
+    height = 0.25,
+    linewidth = 0.8
+  ) +
+  
+  # Point estimate of slope
+  geom_point(
+    size  = 3,
+    shape = 16
+  ) +
+  
+  # Reference line at zero slope (no linear effect of plastic mass)
+  geom_vline(
+    xintercept = 0,
+    linetype   = "dashed",
+    colour     = "grey40"
+  ) +
+  
+  # Axis labels and title
+  labs(
+    x     = "Slope (Z-scaled)",
+    y     = "",
+    title = "Linear model effect sizes (Box–Cox transformed responses)"
+  ) +
+  
+  # Use the same organ palette as other figures
+  scale_colour_manual(values = org_cols, name = "Organ") +
+  
+  # Optional: flip the y-axis order if desired
+  # scale_y_discrete(limits = rev) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid  = element_blank(),
+    axis.line.x = element_line(colour = "black"),
+    plot.title  = element_text(face = "bold", hjust = 0.5)
+  )
+
+# Print figure
+fig3d
+
+```
+
